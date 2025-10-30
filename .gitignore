@@ -1,0 +1,21 @@
+# Node / Frontend
+frontend/node_modules
+frontend/build
+cmd/web/node_modules
+cmd/web/build
+
+# Go binaries
+cmd/*/bin
+cmd/*/main
+
+# IDE / Editor
+.vscode
+.idea
+
+# Docker
+*.log
+*.env
+
+# Config files (keep templates, ignore actual env files)
+configs/*.env
+!configs/*.env.example

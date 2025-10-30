@@ -1,0 +1,125 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": true,
+  "panels": [
+    {
+      "type": "logs",
+      "title": "API Logs",
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 0 },
+      "options": {
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "prettifyLogMessage": true,
+        "showLabels": true,
+        "showTime": true,
+        "wrapLogMessage": true,
+        "fieldConfig": {
+          "overrides": [
+            {
+              "matcher": { "id": "byName", "options": "level" },
+              "properties": [
+                {
+                  "id": "color",
+                  "value": [
+                    { "matcher": "error", "color": "red" },
+                    { "matcher": "warn", "color": "orange" },
+                    { "matcher": "info", "color": "green" }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "loki", "uid": "loki" },
+          "editorMode": "code",
+          "expr": "{container=\"api\"}",
+          "refId": "A"
+        }
+      ],
+      "transparent": false
+    },
+    {
+      "type": "timeseries",
+      "title": "API Log Rate",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 12 },
+      "fieldConfig": {
+        "defaults": { "unit": "ops" },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "single" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "loki", "uid": "loki" },
+          "editorMode": "code",
+          "expr": "sum(rate({container=\"api\"}[1m]))",
+          "refId": "A"
+        }
+      ],
+      "transparent": false
+    },
+    {
+      "type": "logs",
+      "title": "All Services Logs",
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 20 },
+      "options": {
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "prettifyLogMessage": true,
+        "showLabels": true,
+        "showTime": true,
+        "wrapLogMessage": true,
+        "fieldConfig": {
+          "overrides": [
+            {
+              "matcher": { "id": "byName", "options": "level" },
+              "properties": [
+                {
+                  "id": "color",
+                  "value": [
+                    { "matcher": "error", "color": "red" },
+                    { "matcher": "warn", "color": "orange" },
+                    { "matcher": "info", "color": "green" }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "loki", "uid": "loki" },
+          "editorMode": "code",
+          "expr": "{}",
+          "refId": "A"
+        }
+      ],
+      "transparent": false
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["logs", "loki", "live"],
+  "templating": { "list": [] },
+  "time": { "from": "now-15m", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "EIP Logs Live",
+  "uid": "eip-logs-live",
+  "version": 6,
+  "weekStart": ""
+}

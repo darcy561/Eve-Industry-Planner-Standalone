@@ -1,63 +1,166 @@
 services:
-  redis:
-    image: redis:latest
-    container_name: redis
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      start_period: 10s
-      interval: 10s
-      timeout: 5s
-      retries: 5
+  api:
+    build:
+      context: .
+      dockerfile: cmd/api/Dockerfile
+    env_file: ./configs/api.env
+    depends_on:
+      - mongo
+      - redis
+      - nats
+      - minio
     ports:
-      - "6379:6379"
+      - "8080:8080"
+    environment:
+      - LOG_LEVEL=info
+
+  worker:
+    build:
+      context: .
+      dockerfile: cmd/worker/Dockerfile
+    env_file: ./configs/worker.env
+    depends_on:
+      - nats
+      - mongo
+      - minio
+      - redis
+    environment:
+      - LOG_LEVEL=info
+
+  push:
+    build:
+      context: .
+      dockerfile: cmd/push/Dockerfile
+    env_file: ./configs/push.env
+    depends_on:
+      - nats
+      - mongo
+    ports:
+      - "8090:8090"
+    environment:
+      - LOG_LEVEL=info
+
+  scheduler:
+    build:
+      context: .
+      dockerfile: cmd/scheduler/Dockerfile
+    env_file: ./configs/scheduler.env
+    depends_on:
+      - nats
+      - mongo
+      - minio
+      - redis
+    environment:
+      - LOG_LEVEL=info
+
+  # web:
+  #   build: ./cmd/web
+  #   ports:
+  #     - "80:80"
+  #   depends_on:
+  #     - api
+
+  nginx:
+    build: ./nginx
+    container_name: nginx
+    ports:
+      - "3000:80"
     volumes:
-      - redis-data:/data
-    networks:
-      - main
-    
-  mongoDB:
-    image: mongodb/mongodb-community-server:latest
-    container_name: mongoDB
-    ports: 
-      - "27017:27017"
-    volumes:
-      - mongoDB:/data
-    networks:
-      - main
-  
+      - ./frontend/build:/usr/share/nginx/html
+    depends_on:
+      - api
+      - push
+
   nats:
-    image: nats:latest
-    container_name: nats
+    image: nats:2.10.14
+    command: ["-js"]
     ports:
       - "4222:4222"
       - "8222:8222"
-    volumes:
-      - nats:/data
-    networks:
-      - main
 
-  esiworkers:
-    build:
-      context: .
-      dockerfile: dockerfile
-    container_name: esiworkers
+  redis:
+    image: redis:7.4-alpine
     ports:
-      - "8080:8080"
-    depends_on:
-        - nats
-        - redis
+      - "6379:6379"
+
+  mongo:
+    image: mongo:8.0
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
     environment:
-      - REDIS_URL=redis:6379
-      - NATS_URL=nats:4222
-    networks:
-      - main  
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio123
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
+  loki:
+    image: grafana/loki:2.9.8
+    command: -config.file=/etc/loki/local-config.yaml
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./configs/loki-config.yaml:/etc/loki/local-config.yaml:ro
+    depends_on:
+      - nginx
+
+  promtail:
+    image: grafana/promtail:2.9.8
+    command: -config.file=/etc/promtail/config.yml
+    volumes:
+    - ./configs/promtail-config.yaml:/etc/promtail/config.yml:ro
+    - /var/log:/var/log:ro
+    - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      - loki
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./configs/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - loki
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./configs/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - loki
+      - promtail
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.1
+    pid: host
+    ports:
+      - "9100:9100"
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/host
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/host:ro
 
 volumes:
-  redis-data:
-  mongoDB:
-  nats:
-    
-networks: 
-  main:
-    driver: bridge
-  
+  mongo_data:
+  minio_data:
+  grafana_data:

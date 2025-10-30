@@ -1,0 +1,63 @@
+services:
+  redis:
+    image: redis:latest
+    container_name: redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      start_period: 10s
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - main
+    
+  mongoDB:
+    image: mongodb/mongodb-community-server:latest
+    container_name: mongoDB
+    ports: 
+      - "27017:27017"
+    volumes:
+      - mongoDB:/data
+    networks:
+      - main
+  
+  nats:
+    image: nats:latest
+    container_name: nats
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    volumes:
+      - nats:/data
+    networks:
+      - main
+
+  esiworkers:
+    build:
+      context: .
+      dockerfile: dockerfile
+    container_name: esiworkers
+    ports:
+      - "8080:8080"
+    depends_on:
+        - nats
+        - redis
+    environment:
+      - REDIS_URL=redis:6379
+      - NATS_URL=nats:4222
+    networks:
+      - main  
+
+volumes:
+  redis-data:
+  mongoDB:
+  nats:
+    
+networks: 
+  main:
+    driver: bridge
+  
