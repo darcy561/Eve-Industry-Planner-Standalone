@@ -3,7 +3,6 @@ package nats
 import (
 	"errors"
 	"fmt"
-	"strconv"
 	"time"
 
 	"eve-industry-planner/internal/core/config"
@@ -16,25 +15,21 @@ import (
 func Connect() (*natslib.Conn, error) {
 	cfg := config.LoadConfig()
 
-	retryCount, err := strconv.Atoi(cfg.NATSRetryCount)
-	if err != nil {
-		retryCount = 5
-	}
-
-	retryDelay, err := strconv.Atoi(cfg.NATSRetryDelay)
-	if err != nil {
-		retryDelay = 5
-	}
+	retryCount := 5
+	retryDelay := 5 * time.Second
 
 	for i := 0; i < retryCount; i++ {
-		conn, err := natslib.Connect(cfg.NATSURL, natslib.Timeout(5*time.Second))
+		conn, err := natslib.Connect(cfg.NATS_URL, natslib.Timeout(retryDelay))
 		if err == nil {
+			i++
+			message := fmt.Sprintf("Connected to Mongo on attempt %d/%d", i, retryCount)
+			logs.Info(message)
 			return conn, nil
 		}
 		i++
 		message := fmt.Sprintf("Failed to connect to NATS. Attempt %d/%d. Error: %v", i, retryCount, err.Error())
 		logs.Error(message)
-		time.Sleep(time.Duration(retryDelay) * time.Second)
+		time.Sleep(retryDelay)
 	}
 
 	message := fmt.Sprintf("Failed to connect to NATS after %d attempts. Exiting...", retryCount)

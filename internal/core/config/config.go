@@ -5,16 +5,13 @@ import (
 )
 
 type Config struct {
-	MongoURI            string
-	MongoRetryCount     string
-	MongoRetryDelay     string
-	NATSURL             string
-	NATSRetryCount      string
-	NATSRetryDelay      string
-	RedisURL            string
-	RedisRetryCount     string
-	RedisRetryDelay     string
-	MinioEndpoint       string
+	MONGO_URL           string
+	WS_URL              string
+	NATS_URL            string
+	REDIS_URL           string
+	MINIO_URL           string
+	API_PORT            string
+	WS_PORT             string
 	AuthSecret          string
 	ExternalJWTSecret   string
 	ExternalJWTIssuer   string
@@ -23,16 +20,12 @@ type Config struct {
 
 func LoadConfig() Config {
 	return Config{
-		MongoURI:            getEnv("MONGO_URI", "mongodb://mongo:27017/eve_industry"),
-		MongoRetryCount:     getEnv("MONGO_RETRY_COUNT", "5"),
-		MongoRetryDelay:     getEnv("MONGO_RETRY_DELAY", "5"),
-		NATSURL:             getEnv("NATS_URL", "nats://nats:4222"),
-		NATSRetryCount:      getEnv("NATS_RETRY_COUNT", "5"),
-		NATSRetryDelay:      getEnv("NATS_RETRY_DELAY", "5"),
-		RedisURL:            getEnv("REDIS_URL", "redis://redis:6379"),
-		RedisRetryCount:     getEnv("REDIS_RETRY_COUNT", "5"),
-		RedisRetryDelay:     getEnv("REDIS_RETRY_DELAY", "5"),
-		MinioEndpoint:       getEnv("MINIO_ENDPOINT", "http://minio:9000"),
+		MONGO_URL:           getEnv("MONGO_URL", "mongodb://mongo:27017/eve_industry"),
+		REDIS_URL:           getEnv("REDIS_URL", "redis:6379"),
+		NATS_URL:            getEnv("NATS_URL", "nats://nats:4222"),
+		MINIO_URL:           getEnv("MINIO_URL", "http://minio:9000"),
+		API_PORT:            getEnv("API_PORT", "8080"),
+		WS_PORT:             getEnv("WS_PORT", "8091"),
 		AuthSecret:          getEnv("AUTH_SECRET", "dev-secret-change"),
 		ExternalJWTSecret:   getEnv("EXTERNAL_JWT_SECRET", "dev-external-secret"),
 		ExternalJWTIssuer:   getEnv("EXTERNAL_JWT_ISSUER", ""),

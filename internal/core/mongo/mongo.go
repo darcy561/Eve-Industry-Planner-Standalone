@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 	"time"
 
 	"eve-industry-planner/internal/core/config"
@@ -18,28 +17,21 @@ import (
 func Connect() (*mongo.Client, error) {
 	cfg := config.LoadConfig()
 
-	retryCount, err := strconv.Atoi(cfg.MongoRetryCount)
-	if err != nil {
-		retryCount = 5
-	}
-
-	retryDelay, err := strconv.Atoi(cfg.MongoRetryDelay)
-	if err != nil {
-		retryDelay = 5
-	}
+	retryCount := 5
+	retryDelay := 5 * time.Second
 
 	for i := 0; i < retryCount; i++ {
-		client, err := mongo.Connect(context.Background(), options.Client().ApplyURI(cfg.MongoURI))
+		client, err := mongo.Connect(context.Background(), options.Client().ApplyURI(cfg.MONGO_URL))
 		if err == nil {
 			i++
-			message := fmt.Sprintf("Connected to Mongo on attempt %d/%d", i, cfg.MongoRetryCount)
+			message := fmt.Sprintf("Connected to Mongo on attempt %d/%d", i, retryCount)
 			logs.Info(message)
 			return client, nil
 		}
 		i++
-		message := fmt.Sprintf("Failed to connect to Mongo. Attempt %d/%d. Error: %v", i, cfg.MongoRetryCount, err)
+		message := fmt.Sprintf("Failed to connect to Mongo. Attempt %d/%d. Error: %v", i, retryCount, err)
 		logs.Error(message)
-		time.Sleep(time.Duration(retryDelay) * time.Second)
+		time.Sleep(retryDelay)
 	}
 
 	message := fmt.Sprintf("Failed to connect to Mongo after %d attempts. Exiting...", retryCount)

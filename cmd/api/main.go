@@ -11,57 +11,56 @@ import (
 	"eve-industry-planner/internal/shared/logs"
 )
 
-// testLogging emits sample logs at all levels to validate the stack, every 10s until ctx done.
-func testLogging(ctx context.Context) {
-	log := logs.Component("api")
-
-	emit := func() {
-		log.Debug("test debug log", "example", true, "number", 42)
-		log.Info("test info log", "status", "ok")
-		log.Warn("test warn log", "latency_ms", 123)
-		log.Error("test error log", "error", "sample")
-	}
-
-	emit()
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			emit()
-		}
-	}
-}
-
 func main() {
+	// create signal-aware context first so we can cancel on startup failures
+	ctx, cancel := shared.NewSignalContext(context.Background())
+
+	cleanupFns := []func(context.Context){}
+
 	redisClient, err := redis.Connect()
 	if err != nil {
 		logs.Error("failed to connect to redis", "err", err)
+		cancel()
+		shared.WaitForShutdown(ctx, 5*time.Second, cleanupFns...)
 		return
 	}
+	cleanupFns = append(cleanupFns, func(c context.Context) { redis.Cleanup(c, redisClient) })
+
 	mongoClient, err := mongo.Connect()
 	if err != nil {
 		logs.Error("failed to connect to mongo", "err", err)
+		cancel()
+		shared.WaitForShutdown(ctx, 5*time.Second, cleanupFns...)
 		return
 	}
+	cleanupFns = append(cleanupFns, func(c context.Context) { mongo.Cleanup(c, mongoClient) })
+
 	natsConn, err := nats.Connect()
 	if err != nil {
 		logs.Error("failed to connect to nats", "err", err)
+		cancel()
+		shared.WaitForShutdown(ctx, 5*time.Second, cleanupFns...)
 		return
 	}
+	cleanupFns = append(cleanupFns, func(c context.Context) { nats.Cleanup(natsConn) })
 
 	logs.Info("api service running")
 
-	// graceful shutdown via shared helper
-	ctx, _ := shared.NewSignalContext(context.Background())
+	go func() {
+		if err := StartAPIServer(redisClient, mongoClient, natsConn); err != nil {
+			logs.Error("failed to start api server", "err", err)
+			cancel()
+			shared.WaitForShutdown(ctx, 5*time.Second, cleanupFns...)
+			return
+		}
+	}()
 
-	// Emit sample logs so you can verify in Grafana/Loki, loop every 10s
-	go testLogging(ctx)
-	shared.WaitForShutdown(ctx, 5*time.Second,
-		func(c context.Context) { nats.Cleanup(natsConn) },
-		func(c context.Context) { mongo.Cleanup(c, mongoClient) },
-		func(c context.Context) { redis.Cleanup(c, redisClient) },
-	)
+	go func() {
+		if err := StartWSServer(redisClient, mongoClient, natsConn); err != nil {
+			logs.Error("failed to start websocket server", "err", err)
+		}
+	}()
+
+	// normal blocking shutdown path
+	shared.WaitForShutdown(ctx, 5*time.Second, cleanupFns...)
 }

@@ -12,23 +12,32 @@ import (
 )
 
 func main() {
+	// signal-aware context so we can cancel on startup failures
+	ctx, cancel := shared.NewSignalContext(context.Background())
+
+	cleanupFns := []func(context.Context){}
+
 	mongoClient, err := mongo.Connect()
 	if err != nil {
 		logs.Error("failed to connect to mongo", "err", err)
+		cancel()
+		shared.WaitForShutdown(ctx, 5*time.Second, cleanupFns...)
 		return
 	}
+	cleanupFns = append(cleanupFns, func(c context.Context) { mongo.Cleanup(c, mongoClient) })
+
 	natsConn, err := nats.Connect()
 	if err != nil {
 		logs.Error("failed to connect to nats", "err", err)
+		cancel()
+		shared.WaitForShutdown(ctx, 5*time.Second, cleanupFns...)
 		return
 	}
+	cleanupFns = append(cleanupFns, func(c context.Context) { nats.Cleanup(natsConn) })
+
 	_ = ws.StartServer(":8090")
 	logs.Info("push service running")
 
-	// graceful shutdown via shared helper
-	ctx, _ := shared.NewSignalContext(context.Background())
-	shared.WaitForShutdown(ctx, 5*time.Second,
-		func(c context.Context) { nats.Cleanup(natsConn) },
-		func(c context.Context) { mongo.Cleanup(c, mongoClient) },
-	)
+	// normal blocking shutdown
+	shared.WaitForShutdown(ctx, 5*time.Second, cleanupFns...)
 }
