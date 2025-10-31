@@ -75,6 +75,11 @@ func StartAPIServer(redisClient *redis.Client, mongoClient *mongo.Client, natsCo
 				v1endpoints.AuthHandler(w, r, redisClient, mongoClient, natsConn)
 			},
 		},
+		{Path: "/v1/systemindexes",
+			Handler: func(w http.ResponseWriter, r *http.Request) {
+				v1endpoints.SystemIndexesHandler(w, r, redisClient)
+			},
+		},
 	}
 	// Register public routes
 	for _, route := range publicRoutes {

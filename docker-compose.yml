@@ -15,6 +15,7 @@ services:
       - redis
       - nats
       - minio
+      - worker
     env_file:
       - .env
     environment:
@@ -44,6 +45,7 @@ services:
     depends_on:
       - nats
       - mongo
+      - worker
     env_file:
       - .env
     environment:
@@ -59,6 +61,7 @@ services:
       - mongo
       - minio
       - redis
+      - worker
     env_file:
       - .env
     environment:
@@ -87,13 +90,18 @@ services:
   nats:
     <<: *restart_policy
     image: nats:2.10.14
-    command: ["-js"]
+    command: ["-js", "-sd", "/data"]
+    volumes:
+      - nats_data:/data
     env_file:
       - .env
 
   redis:
     <<: *restart_policy
     image: redis:7.4-alpine
+    command: redis-server --appendonly yes --save 60 1000
+    volumes:
+      - redis_data:/data
     env_file:
       - .env
 
@@ -188,3 +196,5 @@ volumes:
   mongo_data:
   minio_data:
   grafana_data:
+  redis_data:
+  nats_data:

@@ -9,10 +9,17 @@ import (
 	"eve-industry-planner/internal/core/redis"
 	"eve-industry-planner/internal/shared"
 	"eve-industry-planner/internal/shared/logs"
+
+	esischedule "eve-industry-planner/cmd/scheduler/esi"
+
+	natslib "github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+	redislib "github.com/redis/go-redis/v9"
+	mongodriver "go.mongodb.org/mongo-driver/mongo"
 )
 
 // startScheduler runs periodic jobs using standard library tickers. Returns a stop function.
-func startScheduler(logComponent string) func() {
+func startScheduler(logComponent string, natsConn *natslib.Conn, jsContext jetstream.JetStream, redisClient *redislib.Client, mongoClient *mongodriver.Client) func() {
 	log := logs.Component(logComponent)
 	stop := make(chan struct{})
 
@@ -30,9 +37,28 @@ func startScheduler(logComponent string) func() {
 		}
 	}()
 
-	// Add more tickers for other periodic jobs as needed
+	// Create job registry to manage all schedulers
+	registry := NewJobRegistry(log)
 
-	return func() { close(stop) }
+	// Register all schedulers
+	registry.Register(esischedule.ScheduleIndustrySystemsRefresh)
+	registry.Register(esischedule.ScheduleAdjustedPricesRefresh)
+	// Add more schedulers here:
+	// registry.Register(market.ScheduleMarketHistoryRefresh)
+
+	// Start all registered schedulers
+	if err := registry.Start(natsConn, jsContext, redisClient, mongoClient); err != nil {
+		log.Error("failed to start job registry", "error", err)
+		return func() {
+			registry.Stop()
+			close(stop)
+		}
+	}
+
+	return func() {
+		registry.Stop()
+		close(stop)
+	}
 }
 
 func main() {
@@ -51,7 +77,7 @@ func main() {
 	}
 	cleanupFns = append(cleanupFns, func(c context.Context) { mongo.Cleanup(c, mongoClient) })
 
-	natsConn, err := nats.Connect()
+	natsConn, jsContext, err := nats.ConnectJetStream()
 	if err != nil {
 		logs.Error("failed to connect to nats", "err", err)
 		cancel()
@@ -72,7 +98,7 @@ func main() {
 	logs.Info("scheduler service running")
 
 	// Start lightweight scheduler (tickers)
-	stop := startScheduler("scheduler")
+	stop := startScheduler("scheduler", natsConn, jsContext, redisClient, mongoClient)
 	cleanupFns = append(cleanupFns, func(c context.Context) { stop() })
 
 	// normal blocking shutdown
