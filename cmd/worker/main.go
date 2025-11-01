@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	esicore "eve-industry-planner/internal/core/esi"
 	"eve-industry-planner/internal/core/mongo"
 	natscore "eve-industry-planner/internal/core/nats"
 	"eve-industry-planner/internal/core/redis"
@@ -64,6 +65,11 @@ func main() {
 	}
 	cleanupFns = append(cleanupFns, func(c context.Context) { redis.Cleanup(c, redisClient) })
 
+	// Initialize ESI client with rate limiting
+	// Groups will be discovered dynamically from X-Ratelimit-Group headers
+	esiClient := esicore.NewESIClient("https://esi.evetech.net", 1.0, 2)
+	logs.Info("ESI rate-limited client initialized (dynamic group discovery enabled)")
+
 	// Create goroutine pool for distributing tasks
 	// Pool size: 100 workers (can be adjusted based on load)
 	// Using blocking mode so tasks wait for pool availability
@@ -86,7 +92,7 @@ func main() {
 	// Setup all subscribers
 	subscribers := []struct {
 		name    string
-		setupFn func(jetstream.JetStream, *redislib.Client, *antslib.Pool, *natslib.Conn) (func(context.Context), error)
+		setupFn func(jetstream.JetStream, *redislib.Client, *antslib.Pool, *natslib.Conn, esicore.ClientInterface) (func(context.Context), error)
 	}{
 		{"systemIndexes", SubscribeSystemIndexes},
 		{"adjustedPrices", SubscribeAdjustedPrices},
@@ -94,7 +100,7 @@ func main() {
 
 	// Initialize all subscribers on startup
 	for _, sub := range subscribers {
-		cleanup, err := sub.setupFn(js, redisClient, pool, natsConn)
+		cleanup, err := sub.setupFn(js, redisClient, pool, natsConn, esiClient)
 		if err != nil {
 			logs.Error("failed to setup subscriber", "subscriber", sub.name, "error", err)
 			cancel()

@@ -7,6 +7,7 @@ cmd/web/build
 # Go binaries
 cmd/*/bin
 cmd/*/main
+*.exe
 
 # IDE / Editor
 .vscode

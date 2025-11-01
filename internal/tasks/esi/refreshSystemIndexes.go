@@ -5,20 +5,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math/rand"
 	"net/http"
-	"net/url"
-	"strconv"
-	"strings"
 	"time"
 
+	esicore "eve-industry-planner/internal/core/esi"
 	natscore "eve-industry-planner/internal/core/nats"
 	rediscore "eve-industry-planner/internal/core/redis"
-	schedulercore "eve-industry-planner/internal/scheduler"
 	"eve-industry-planner/internal/shared/logs"
 	"eve-industry-planner/internal/shared/metrics"
-	taskscore "eve-industry-planner/internal/tasks"
 
 	natslib "github.com/nats-io/nats.go"
 	redislib "github.com/redis/go-redis/v9"
@@ -52,45 +49,42 @@ type SystemIndexes struct {
 // It checks for HTTP 304 Not Modified responses to avoid unnecessary work when data hasn't changed.
 // When data has changed, each item is persisted to Redis in the stream callback, and the ETag
 // is saved after a successful pass. Cache headers are respected for scheduling future refreshes.
-func RefreshSystemIndexes(natsMessage MessageInterface, redisClient *redislib.Client, natsConn *natslib.Conn) {
+func RefreshSystemIndexes(natsMessage MessageInterface, redisClient *redislib.Client, natsConn *natslib.Conn, esiClient esicore.ClientInterface) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	client := sharedHTTPClient
+	deliveryCount := uint64(0)
+	if natsMessage != nil {
+		deliveryCount = natsMessage.NumDelivered()
+	}
+	logs.Info("starting system indexes refresh", "delivery_count", deliveryCount)
 
 	// Acquire a lock to prevent concurrent refreshes
 	lockKey := "esi:industry_systems:refresh_lock"
 	lockAcquired, cleanup, err := rediscore.AcquireRefreshLock(ctx, redisClient, lockKey)
 	if err != nil {
-		logs.Warn("failed to acquire refresh lock", "error", err)
+		logs.Warn("failed to acquire refresh lock, acknowledging message", "error", err, "delivery_count", deliveryCount)
 		if natsMessage != nil {
-			_ = natsMessage.Ack()
+			if ackErr := natsMessage.Ack(); ackErr != nil {
+				logs.Warn("failed to ack message after lock error", "error", ackErr)
+			} else {
+				logs.Info("message acknowledged after lock acquisition error", "delivery_count", deliveryCount)
+			}
 		}
 		return
 	}
 	if !lockAcquired {
-		logs.Info("skipping refresh, another refresh in progress")
+		logs.Info("skipping refresh, another refresh in progress, acknowledging message", "delivery_count", deliveryCount)
 		if natsMessage != nil {
-			_ = natsMessage.Ack()
+			if ackErr := natsMessage.Ack(); ackErr != nil {
+				logs.Warn("failed to ack message when lock already held", "error", ackErr)
+			} else {
+				logs.Info("message acknowledged (lock already held)", "delivery_count", deliveryCount)
+			}
 		}
 		return
 	}
 	defer cleanup()
-
-	// Check if we should skip refresh based on next_refresh timestamp
-	nextRefresh, err := rediscore.GetIndustrySystemsNextRefresh(ctx, redisClient)
-	if err == nil && nextRefresh > 0 {
-		now := time.Now().UnixMilli()
-		if now < nextRefresh {
-			skipDuration := time.Duration(nextRefresh-now) * time.Millisecond
-			logs.Info("skipping refresh, not due yet", "next_refresh_ms", nextRefresh, "now_ms", now, "skip_duration_ms", skipDuration.Milliseconds())
-			if natsMessage != nil {
-				_ = natsMessage.Ack()
-			}
-			// No need to reschedule - scheduler already has this time scheduled
-			return
-		}
-	}
 
 	// Read previous ETag from Redis (if available) to leverage 304s.
 	prevETag, err := rediscore.GetIndustrySystemsETag(ctx, redisClient)
@@ -109,7 +103,7 @@ func RefreshSystemIndexes(natsMessage MessageInterface, redisClient *redislib.Cl
 
 	var totalBytes int64
 	var cacheSeconds int
-	newETag, notModified, bytesRead, err := StreamIndustrySystems(ctx, client, prevETag, func(s SystemIndexes) error {
+	newETag, notModified, bytesRead, err := StreamIndustrySystems(ctx, natsMessage, esiClient, prevETag, func(s SystemIndexes) error {
 		if err := rediscore.SaveIndustrySystemIndex(ctx, redisClient, s.SolarSystemID, s); err != nil {
 			return err
 		}
@@ -125,7 +119,97 @@ func RefreshSystemIndexes(natsMessage MessageInterface, redisClient *redislib.Cl
 	}, &cacheSeconds)
 	totalBytes = bytesRead
 	if err != nil {
-		logs.Error("failed streaming ESI industry systems", "error", err, "reason", "stream_error")
+		logs.Debug("stream industry systems returned error", "error", err, "error_type", fmt.Sprintf("%T", err), "delivery_count", deliveryCount)
+
+		// Check if this is a rate limit error
+		if esicore.IsRateLimitError(err) {
+			logs.Info("detected rate limit error in system indexes refresh", "error", err, "delivery_count", deliveryCount)
+			rateLimitErr := esicore.GetRateLimitError(err)
+
+			logs.Debug("rate limit error details",
+				"retryable", rateLimitErr.Retryable,
+				"retry_after", rateLimitErr.RetryAfter,
+				"reason", rateLimitErr.Reason,
+				"group", rateLimitErr.Group,
+				"token_used", rateLimitErr.TokenUsed,
+				"token_limit", rateLimitErr.TokenLimit,
+				"estimated_tokens", rateLimitErr.EstimatedTokens,
+				"delivery_count", deliveryCount)
+
+			// Check if it's retryable
+			if esicore.IsRetryableRateLimitError(err) {
+				logs.Info("rate limit error is retryable, attempting NATS redelivery", "delivery_count", deliveryCount)
+				if natsMessage != nil {
+					waitDuration := time.Until(rateLimitErr.RetryAfter)
+					now := time.Now()
+
+					logs.Debug("calculating wait duration for redelivery",
+						"now", now,
+						"retry_after", rateLimitErr.RetryAfter,
+						"wait_duration", waitDuration,
+						"wait_duration_seconds", waitDuration.Seconds(),
+						"delivery_count", deliveryCount)
+
+					if waitDuration > 0 {
+						logs.Info("system indexes refresh rate limited, delaying redelivery",
+							"retry_after", rateLimitErr.RetryAfter,
+							"wait_duration", waitDuration,
+							"wait_duration_seconds", waitDuration.Seconds(),
+							"wait_duration_minutes", waitDuration.Minutes(),
+							"reason", rateLimitErr.Reason,
+							"group", rateLimitErr.Group,
+							"token_used", rateLimitErr.TokenUsed,
+							"token_limit", rateLimitErr.TokenLimit,
+							"estimated_tokens", rateLimitErr.EstimatedTokens,
+							"delivery_count", deliveryCount)
+
+						logs.Debug("calling NakWithDelay", "delay", waitDuration, "delivery_count", deliveryCount)
+						if nakErr := natsMessage.NakWithDelay(waitDuration); nakErr != nil {
+							logs.Error("failed to nack with delay, falling back to normal nack",
+								"nak_error", nakErr,
+								"nak_error_type", fmt.Sprintf("%T", nakErr),
+								"requested_delay", waitDuration,
+								"delivery_count", deliveryCount)
+							// Fall back to normal nack
+							logs.Warn("falling back to NackWithBackoff", "delivery_count", deliveryCount)
+							natscore.NackWithBackoff(natsMessage)
+						} else {
+							logs.Info("successfully called NakWithDelay, message will be redelivered after delay",
+								"delay", waitDuration,
+								"redelivery_time", rateLimitErr.RetryAfter,
+								"delivery_count", deliveryCount)
+						}
+						return
+					} else {
+						logs.Warn("wait duration is <= 0, cannot delay redelivery, falling back to normal nack",
+							"wait_duration", waitDuration,
+							"retry_after", rateLimitErr.RetryAfter,
+							"now", now,
+							"delivery_count", deliveryCount)
+						natscore.NackWithBackoff(natsMessage)
+						return
+					}
+				} else {
+					logs.Warn("rate limit error is retryable but natsMessage is nil, cannot delay redelivery",
+						"delivery_count", deliveryCount)
+				}
+			} else {
+				logs.Warn("rate limit error is NOT retryable, using normal nack backoff",
+					"reason", rateLimitErr.Reason,
+					"group", rateLimitErr.Group,
+					"delivery_count", deliveryCount)
+				if natsMessage != nil {
+					natscore.NackWithBackoff(natsMessage)
+				}
+				return
+			}
+		}
+
+		logs.Error("failed streaming ESI industry systems, nacking with backoff",
+			"error", err,
+			"error_type", fmt.Sprintf("%T", err),
+			"reason", "stream_error",
+			"delivery_count", deliveryCount)
 		if natsMessage != nil {
 			natscore.NackWithBackoff(natsMessage)
 		}
@@ -134,24 +218,27 @@ func RefreshSystemIndexes(natsMessage MessageInterface, redisClient *redislib.Cl
 	}
 
 	if notModified {
-		logs.Info("ESI industry systems not modified (ETag match)", "etag_new", newETag)
+		logs.Info("ESI industry systems not modified (ETag match), acknowledging message", "etag_new", newETag, "delivery_count", deliveryCount)
 		if natsMessage != nil {
-			_ = natsMessage.Ack()
+			if ackErr := natsMessage.Ack(); ackErr != nil {
+				logs.Warn("failed to ack message (not modified)", "error", ackErr)
+			} else {
+				logs.Info("message acknowledged (not modified)", "delivery_count", deliveryCount)
+			}
 		}
 		m := metrics.GetESIIndustrySystems()
 		m.Requests.Observe(time.Since(start).Seconds())
 		m.Bytes.Add(float64(totalBytes))
-		// Update next_refresh timestamp if cache headers available, but don't schedule - assume schedule already exists
+		// Update metrics if cache headers available (for monitoring)
 		if cacheSeconds > 0 {
 			nextRefreshMillis := time.Now().Add(time.Duration(cacheSeconds) * time.Second).UnixMilli()
-			_ = rediscore.SetString(ctx, redisClient, "esi:industry_systems:next_refresh", strconv.FormatInt(nextRefreshMillis, 10), 0)
 			metrics.GetESIIndustrySystems().NextRefresh.Set(float64(nextRefreshMillis))
 		}
 		return
 	}
 
 	if err := rediscore.SaveIndustrySystemsETag(ctx, redisClient, newETag); err != nil {
-		logs.Error("failed to save ETag", "error", err, "reason", "etag_save_error")
+		logs.Error("failed to save ETag, nacking with backoff", "error", err, "reason", "etag_save_error", "delivery_count", deliveryCount)
 		if natsMessage != nil {
 			natscore.NackWithBackoff(natsMessage)
 		}
@@ -161,7 +248,7 @@ func RefreshSystemIndexes(natsMessage MessageInterface, redisClient *redislib.Cl
 
 	// Save last updated timestamp
 	if err := rediscore.SaveIndustrySystemsLastUpdated(ctx, redisClient, time.Now().UnixMilli()); err != nil {
-		logs.Warn("failed to save last updated timestamp", "error", err, "reason", "last_updated_save_error")
+		logs.Warn("failed to save last updated timestamp, nacking with backoff", "error", err, "reason", "last_updated_save_error", "delivery_count", deliveryCount)
 		if natsMessage != nil {
 			natscore.NackWithBackoff(natsMessage)
 		}
@@ -169,22 +256,19 @@ func RefreshSystemIndexes(natsMessage MessageInterface, redisClient *redislib.Cl
 		return
 	}
 
-	// Respect cache headers for scheduling next refresh
-	var nextRefreshMillis int64
+	// Update metrics if cache headers available (for monitoring)
 	if cacheSeconds > 0 {
-		nextRefreshMillis = time.Now().Add(time.Duration(cacheSeconds) * time.Second).UnixMilli()
-		_ = rediscore.SetString(ctx, redisClient, "esi:industry_systems:next_refresh", strconv.FormatInt(nextRefreshMillis, 10), 0)
+		nextRefreshMillis := time.Now().Add(time.Duration(cacheSeconds) * time.Second).UnixMilli()
 		metrics.GetESIIndustrySystems().NextRefresh.Set(float64(nextRefreshMillis))
 	}
 
 	// Acknowledge message completion
 	if natsMessage != nil {
-		_ = natsMessage.Ack()
-	}
-
-	// Schedule next refresh based on cache headers
-	if natsConn != nil && nextRefreshMillis > 0 {
-		_ = schedulercore.PublishScheduleRequest(natsConn, taskscore.TaskTypeRefreshSystemIndexes, nextRefreshMillis, nil)
+		if ackErr := natsMessage.Ack(); ackErr != nil {
+			logs.Warn("failed to ack message (success)", "error", ackErr, "delivery_count", deliveryCount)
+		} else {
+			logs.Info("message acknowledged (success)", "delivery_count", deliveryCount)
+		}
 	}
 
 	duration := time.Since(start)
@@ -202,42 +286,82 @@ func RefreshSystemIndexes(natsMessage MessageInterface, redisClient *redislib.Cl
 // onItem for each normalized SystemIndexes. Callers typically persist within the callback.
 // Returns the new ETag, whether it was not modified (HTTP 304), bytes read, and any error.
 // cacheSecondsOut will be populated with parsed cache max-age from response headers if available.
-func StreamIndustrySystems(ctx context.Context, httpClient *http.Client, etag string, onItem func(SystemIndexes) error, cacheSecondsOut *int) (string, bool, int64, error) {
-	if httpClient == nil {
-		return "", false, 0, errors.New("http client is nil")
+func StreamIndustrySystems(ctx context.Context, natsMessage MessageInterface, esiClient esicore.ClientInterface, etag string, onItem func(SystemIndexes) error, cacheSecondsOut *int) (string, bool, int64, error) {
+	if esiClient == nil {
+		return "", false, 0, errors.New("ESI client is nil")
 	}
 	if onItem == nil {
 		return "", false, 0, errors.New("onItem callback is nil")
 	}
 
-	baseURL := &url.URL{Scheme: "https", Host: "esi.evetech.net", Path: "/v1/industry/systems/"}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL.String(), nil)
-	if err != nil {
-		return "", false, 0, err
+	path := "/v1/industry/systems/"
+	headers := map[string]string{
+		"Accept":          "application/json",
+		"Accept-Encoding": "gzip",
 	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Accept-Encoding", "gzip")
-	req.Header.Set("User-Agent", "EveIndustryPlanner/1.0 (contact: admin@local)")
 	if etag != "" {
-		req.Header.Set("If-None-Match", etag)
+		headers["If-None-Match"] = etag
 	}
 
 	// Retry on transient errors with exponential backoff + jitter
+	// Check for rate limit errors and reschedule if retryable
 	var resp *http.Response
 	maxAttempts := 4
+	var err error
+
+	logs.Debug("starting ESI request loop for industry systems", "path", path, "etag_provided", etag != "", "max_attempts", maxAttempts)
+
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		resp, err = httpClient.Do(req)
+		logs.Debug("making ESI request attempt", "attempt", attempt, "max_attempts", maxAttempts, "path", path)
+		resp, err = esiClient.DoRequest(ctx, http.MethodGet, path, headers)
 		if err == nil {
+			logs.Debug("ESI request succeeded", "attempt", attempt, "path", path)
 			break
 		}
+
+		logs.Debug("ESI request failed",
+			"attempt", attempt,
+			"max_attempts", maxAttempts,
+			"error", err,
+			"error_type", fmt.Sprintf("%T", err),
+			"path", path)
+
+		// Check if this is a rate limit error
+		if esicore.IsRateLimitError(err) {
+			rateLimitErr := esicore.GetRateLimitError(err)
+			logs.Info("rate limit error detected in stream function, returning for NATS redelivery",
+				"attempt", attempt,
+				"retryable", rateLimitErr.Retryable,
+				"retry_after", rateLimitErr.RetryAfter,
+				"reason", rateLimitErr.Reason,
+				"group", rateLimitErr.Group,
+				"token_used", rateLimitErr.TokenUsed,
+				"token_limit", rateLimitErr.TokenLimit,
+				"estimated_tokens", rateLimitErr.EstimatedTokens,
+				"path", path)
+
+			// Check if this is a retryable rate limit error - return it for NATS redelivery handling
+			if esicore.IsRetryableRateLimitError(err) {
+				logs.Debug("rate limit error is retryable, returning error for caller to handle redelivery", "path", path)
+				// Return the error so caller can handle NATS redelivery with delay
+				return "", false, 0, err
+			} else {
+				logs.Warn("rate limit error is NOT retryable, returning error anyway", "path", path, "reason", rateLimitErr.Reason)
+				return "", false, 0, err
+			}
+		}
+
 		if attempt >= maxAttempts {
+			logs.Debug("max attempts reached, returning error", "attempt", attempt, "max_attempts", maxAttempts, "error", err)
 			return "", false, 0, err
 		}
 		// Exponential backoff: 500ms, 1s, 2s
 		backoff := time.Duration(500*(1<<uint(attempt-1))) * time.Millisecond
 		// Jitter: random 0-100ms
 		jitter := time.Duration(rand.Intn(100)) * time.Millisecond
-		time.Sleep(backoff + jitter)
+		waitTime := backoff + jitter
+		logs.Debug("waiting before retry with exponential backoff", "attempt", attempt, "backoff", backoff, "jitter", jitter, "wait_time", waitTime)
+		time.Sleep(waitTime)
 	}
 	if resp != nil {
 		defer resp.Body.Close()
@@ -324,71 +448,4 @@ func StreamIndustrySystems(ctx context.Context, httpClient *http.Client, etag st
 	}
 
 	return newETag, false, cr.n, nil
-}
-
-// saveSystemIndexes stores each system's data in Redis as JSON at key "esi:industry_systems:<solarSystemId>".
-func saveSystemIndexes(ctx context.Context, rdb *redislib.Client, systems []SystemIndexes) error {
-	for _, s := range systems {
-		if err := rediscore.SaveIndustrySystemIndex(ctx, rdb, s.SolarSystemID, s); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// countingReader counts bytes read from an underlying reader
-type countingReader struct {
-	r io.Reader
-	n int64
-}
-
-func (c *countingReader) Read(p []byte) (int, error) {
-	n, err := c.r.Read(p)
-	c.n += int64(n)
-	return n, err
-}
-
-// parseCacheSeconds extracts max-age seconds from Cache-Control or computes from Expires header
-func parseCacheSeconds(resp *http.Response) int {
-	cc := resp.Header.Get("Cache-Control")
-	if cc != "" {
-		parts := strings.Split(cc, ",")
-		for _, p := range parts {
-			p = strings.TrimSpace(p)
-			if strings.HasPrefix(p, "max-age=") {
-				v := strings.TrimPrefix(p, "max-age=")
-				if secs, err := strconv.Atoi(v); err == nil && secs > 0 {
-					return secs
-				}
-			}
-		}
-	}
-	if exp := resp.Header.Get("Expires"); exp != "" {
-		if t, err := http.ParseTime(exp); err == nil {
-			d := time.Until(t)
-			if d > 0 {
-				return int(d.Seconds())
-			}
-		}
-	}
-	return 0
-}
-
-// Shared HTTP client with tuned transport
-var sharedHTTPClient = &http.Client{
-	Transport: tunedTransport(),
-	Timeout:   30 * time.Second,
-}
-
-func tunedTransport() *http.Transport {
-	return &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   10,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		ForceAttemptHTTP2:     true,
-		DisableCompression:    false,
-	}
 }

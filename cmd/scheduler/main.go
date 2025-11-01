@@ -23,20 +23,6 @@ func startScheduler(logComponent string, natsConn *natslib.Conn, jsContext jetst
 	log := logs.Component(logComponent)
 	stop := make(chan struct{})
 
-	// Heartbeat every 30 seconds
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				log.Info("scheduler heartbeat", "ts", time.Now().UTC().Format(time.RFC3339))
-			case <-stop:
-				return
-			}
-		}
-	}()
-
 	// Create job registry to manage all schedulers
 	registry := NewJobRegistry(log)
 

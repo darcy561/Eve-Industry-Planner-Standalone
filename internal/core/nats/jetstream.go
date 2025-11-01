@@ -46,22 +46,40 @@ type StreamConfig struct {
 }
 
 // GetOrCreateConsumer gets an existing consumer or creates a new one with the specified config.
-// If a consumer exists with a different DeliverPolicy, it will be deleted and recreated
-// since DeliverPolicy is immutable on existing consumers.
+// If a consumer exists with a different DeliverPolicy or FilterSubject, it will be deleted and recreated
+// since these are immutable on existing consumers.
 func GetOrCreateConsumer(ctx context.Context, stream jetstream.Stream, consumerConfig jetstream.ConsumerConfig) (jetstream.Consumer, error) {
 	// Try to get existing consumer
 	existingConsumer, err := stream.Consumer(ctx, consumerConfig.Durable)
 	if err == nil {
-		// Consumer exists, check if DeliverPolicy matches (it's immutable, so if it doesn't match, we need to delete and recreate)
+		// Consumer exists, check if immutable config matches
 		info := existingConsumer.CachedInfo()
-		if info == nil || info.Config.DeliverPolicy != consumerConfig.DeliverPolicy {
-			// Delete the existing consumer to recreate with correct policy
+		if info == nil {
+			// Can't check config, delete and recreate
 			if err := stream.DeleteConsumer(ctx, consumerConfig.Durable); err != nil {
-				logs.Warn("failed to delete existing consumer with different policy", "consumer", consumerConfig.Durable, "error", err)
+				logs.Warn("failed to delete existing consumer", "consumer", consumerConfig.Durable, "error", err)
 			}
 		} else {
-			// Consumer exists with correct policy, use it
-			return existingConsumer, nil
+			needsRecreate := false
+			// Check DeliverPolicy (immutable)
+			if info.Config.DeliverPolicy != consumerConfig.DeliverPolicy {
+				logs.Info("consumer DeliverPolicy mismatch, will recreate", "consumer", consumerConfig.Durable, "existing", info.Config.DeliverPolicy, "requested", consumerConfig.DeliverPolicy)
+				needsRecreate = true
+			}
+			// Check FilterSubject (immutable)
+			if info.Config.FilterSubject != consumerConfig.FilterSubject {
+				logs.Info("consumer FilterSubject mismatch, will recreate", "consumer", consumerConfig.Durable, "existing", info.Config.FilterSubject, "requested", consumerConfig.FilterSubject)
+				needsRecreate = true
+			}
+			if needsRecreate {
+				// Delete the existing consumer to recreate with correct config
+				if err := stream.DeleteConsumer(ctx, consumerConfig.Durable); err != nil {
+					logs.Warn("failed to delete existing consumer with different config", "consumer", consumerConfig.Durable, "error", err)
+				}
+			} else {
+				// Consumer exists with correct config, use it
+				return existingConsumer, nil
+			}
 		}
 	}
 

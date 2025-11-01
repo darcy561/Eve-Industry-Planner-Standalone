@@ -1,40 +1,32 @@
 package scheduler
 
 import (
+	"context"
 	"encoding/json"
 
-	natslib "github.com/nats-io/nats.go"
+	natscore "eve-industry-planner/internal/core/nats"
+
+	"github.com/nats-io/nats.go/jetstream"
 )
 
-// ScheduleRequest represents a request to schedule a task
-type ScheduleRequest struct {
-	JobID    string          `json:"job_id,omitempty"` // Unique job identifier (optional, will be generated if not provided)
-	TaskType string          `json:"task_type"`        // e.g., "refreshSystemIndexes"
-	RunAt    int64           `json:"run_at"`           // Unix timestamp in milliseconds
-	Data     json.RawMessage `json:"data,omitempty"`   // Optional JSON-encoded data to pass to the task handler
-}
+// ScheduleRequest is an alias for natscore.ScheduleRequest.
+// Deprecated: Use natscore.ScheduleRequest directly instead.
+type ScheduleRequest = natscore.ScheduleRequest
 
-// PublishScheduleRequest is a helper function that any service can use to publish a schedule request
-// data can be nil if no data is needed
-func PublishScheduleRequest(natsConn *natslib.Conn, taskType string, runAt int64, data json.RawMessage) error {
-	req := ScheduleRequest{
-		TaskType: taskType,
-		RunAt:    runAt,
-		Data:     data,
-	}
+// PublishScheduleRequest publishes a ScheduleRequest message to JetStream.
+// The request is automatically marshaled to JSON and published to the scheduler:schedule subject.
+func PublishScheduleRequest(js jetstream.JetStream, req natscore.ScheduleRequest) error {
 	reqData, err := json.Marshal(req)
 	if err != nil {
 		return err
 	}
-	if err := natsConn.Publish("scheduler:schedule", reqData); err != nil {
-		return err
-	}
-	return natsConn.Flush()
+	_, err = js.Publish(context.Background(), natscore.SubjectSchedulerSchedule, reqData)
+	return err
 }
 
-// PublishScheduleRequestWithData is a convenience function to publish a schedule request with structured data
-// It automatically marshals the data parameter to JSON
-func PublishScheduleRequestWithData(natsConn *natslib.Conn, taskType string, runAt int64, data interface{}) error {
+// PublishScheduleRequestWithData is a convenience function to publish a schedule request with structured data.
+// It automatically marshals the data parameter to JSON and creates a ScheduleRequest.
+func PublishScheduleRequestWithData(js jetstream.JetStream, taskType string, runAt int64, data interface{}) error {
 	var rawData json.RawMessage
 	if data != nil {
 		var err error
@@ -43,5 +35,45 @@ func PublishScheduleRequestWithData(natsConn *natslib.Conn, taskType string, run
 			return err
 		}
 	}
-	return PublishScheduleRequest(natsConn, taskType, runAt, rawData)
+	req := natscore.ScheduleRequest{
+		TaskType: taskType,
+		RunAt:    runAt,
+		Data:     rawData,
+	}
+	return PublishScheduleRequest(js, req)
+}
+
+// PublishEmptyMessage publishes an EmptyMessage to the specified subject.
+// Used for simple trigger messages where no data is needed.
+func PublishEmptyMessage(js jetstream.JetStream, subject string) error {
+	msg := natscore.EmptyMessage{}
+	msgData, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	_, err = js.Publish(context.Background(), subject, msgData)
+	return err
+}
+
+// PublishTaskMessage publishes a TaskMessage to the specified subject.
+// Used for task triggers that need to pass arbitrary data.
+func PublishTaskMessage(js jetstream.JetStream, subject string, taskType string, data interface{}) error {
+	var rawData json.RawMessage
+	if data != nil {
+		var err error
+		rawData, err = json.Marshal(data)
+		if err != nil {
+			return err
+		}
+	}
+	msg := natscore.TaskMessage{
+		TaskType: taskType,
+		Data:     rawData,
+	}
+	msgData, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	_, err = js.Publish(context.Background(), subject, msgData)
+	return err
 }

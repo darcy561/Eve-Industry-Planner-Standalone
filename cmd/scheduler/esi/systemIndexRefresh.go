@@ -3,98 +3,33 @@ package esi
 import (
 	"context"
 	"encoding/json"
-	"log/slog"
-	"strconv"
 	"time"
 
 	natscore "eve-industry-planner/internal/core/nats"
 	"eve-industry-planner/internal/scheduler"
 	taskscore "eve-industry-planner/internal/tasks"
-
-	"github.com/nats-io/nats.go/jetstream"
-	redislib "github.com/redis/go-redis/v9"
 )
 
-// ScheduleIndustrySystemsRefresh sets up the task handler for industry systems refresh.
+// ScheduleIndustrySystemsRefresh sets up a static cron job for industry systems refresh (hourly).
 // Returns a cleanup function and an error if scheduling fails.
 func ScheduleIndustrySystemsRefresh(deps scheduler.Dependencies, sched scheduler.Scheduler) (func(), error) {
 	jsContext := deps.JSContext
-	redisClient := deps.Redis
 	log := deps.Log
 
 	// Register the task handler
 	sched.RegisterHandler(taskscore.TaskTypeRefreshSystemIndexes, func(ctx context.Context, data json.RawMessage) error {
-		// data is optional - for refreshSystemIndexes we don't need it, but the interface requires it
-		return triggerIndustrySystemsRefresh(jsContext, log, redisClient, ctx)
+		// Just publish to JetStream - the worker will handle the actual refresh
+		subject := natscore.SubjectRefreshSystemIndexes
+		log.Info("publishing industry systems refresh trigger", "subject", subject)
+
+		// Use standard EmptyMessage helper for simple trigger messages
+		if err := scheduler.PublishEmptyMessage(jsContext, subject); err != nil {
+			log.Error("failed to publish industry systems refresh trigger", "subject", subject, "error", err)
+			return err
+		}
+
+		log.Info("industry systems refresh triggered", "subject", subject, "timestamp", time.Now().UnixNano())
+		return nil
 	})
-
-	// Return a function that will run the startup check AFTER RestoreJobs completes
-	// This will be called by the registry after restoration
-	startupCheck := func() {
-		ctx := context.Background()
-		taskType := taskscore.TaskTypeRefreshSystemIndexes
-
-		// First check if there's already a scheduled job for this task type (restored from Redis)
-		if sched.HasScheduledJob(taskType) {
-			log.Info("scheduled job already exists, skipping startup check")
-			return
-		}
-
-		nextRefresh, err := getNextRefreshTime(redisClient, ctx)
-		now := time.Now()
-
-		if err != nil {
-			// No data exists, trigger immediately
-			log.Info("no existing data found, triggering initial refresh")
-			triggerIndustrySystemsRefresh(jsContext, log, redisClient, ctx)
-			return
-		}
-
-		if !nextRefresh.After(now) {
-			// Data is stale, trigger refresh
-			log.Info("data is stale, triggering refresh",
-				"next_refresh", nextRefresh.Format(time.RFC3339),
-				"now", now.Format(time.RFC3339))
-			triggerIndustrySystemsRefresh(jsContext, log, redisClient, ctx)
-			return
-		}
-
-		// Data is fresh - no need to schedule, worker will schedule next refresh when it runs
-		log.Info("data is fresh, waiting for worker to schedule next refresh",
-			"next_refresh", nextRefresh.Format(time.RFC3339),
-			"fresh_for", time.Until(nextRefresh).String())
-	}
-
-	// Return cleanup function and startup check function
-	// The registry will call startupCheck after RestoreJobs completes
-	return func() {
-		startupCheck()
-	}, nil
-}
-
-// getNextRefreshTime reads the next_refresh timestamp from Redis and returns a time.Time
-func getNextRefreshTime(redisClient *redislib.Client, ctx context.Context) (time.Time, error) {
-	s, err := redisClient.Get(ctx, "esi:industry_systems:next_refresh").Result()
-	if err != nil {
-		return time.Time{}, err
-	}
-	millis, err := strconv.ParseInt(s, 10, 64)
-	if err != nil {
-		return time.Time{}, err
-	}
-	return time.Unix(0, millis*int64(time.Millisecond)), nil
-}
-
-// triggerIndustrySystemsRefresh publishes a JetStream message to trigger industry systems refresh
-func triggerIndustrySystemsRefresh(js jetstream.JetStream, log *slog.Logger, redisClient *redislib.Client, ctx context.Context) error {
-	subject := natscore.SubjectRefreshSystemIndexes
-
-	// Publish to JetStream stream
-	_, err := js.Publish(ctx, subject, []byte(""))
-	if err != nil {
-		log.Error("failed to publish industry systems refresh trigger", "error", err)
-		return err
-	}
-	log.Info("industry systems refresh triggered", "subject", subject)
-	return nil
+	return func() {}, nil
 }

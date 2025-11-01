@@ -4,6 +4,7 @@ import (
 	"log/slog"
 
 	"eve-industry-planner/internal/scheduler"
+	taskscore "eve-industry-planner/internal/tasks"
 
 	natslib "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -21,7 +22,7 @@ type JobRegistry struct {
 	log              *slog.Logger
 	cleanups         []func()
 	schedulers       []SchedulerFunc
-	schedulerHandler *SchedulerHandler
+	schedulerHandler *TaskScheduler
 }
 
 // NewJobRegistry creates a new job registry
@@ -40,13 +41,10 @@ func (r *JobRegistry) Register(scheduler SchedulerFunc) {
 
 // Start registers all schedulers
 func (r *JobRegistry) Start(natsConn *natslib.Conn, jsContext jetstream.JetStream, redisClient *redislib.Client, mongoClient *mongodriver.Client) error {
-	// Create and start the scheduler handler first
+	// Create the task scheduler
 	var err error
-	r.schedulerHandler, err = NewSchedulerHandler(natsConn, jsContext, redisClient, r.log)
+	r.schedulerHandler, err = NewTaskScheduler(jsContext, redisClient, natsConn, r.log)
 	if err != nil {
-		return err
-	}
-	if err := r.schedulerHandler.Start(); err != nil {
 		return err
 	}
 
@@ -58,7 +56,7 @@ func (r *JobRegistry) Start(natsConn *natslib.Conn, jsContext jetstream.JetStrea
 		Log:       r.log,
 	}
 
-	// Register handlers first (needed for restore)
+	// Register handlers first
 	for _, schedulerFunc := range r.schedulers {
 		cleanup, err := schedulerFunc(deps, r.schedulerHandler)
 		if err != nil {
@@ -69,17 +67,25 @@ func (r *JobRegistry) Start(natsConn *natslib.Conn, jsContext jetstream.JetStrea
 		r.cleanups = append(r.cleanups, cleanup)
 	}
 
-	// Restore persisted jobs after all handlers are registered
-	// This will filter out invalid/expired jobs and track which task types have scheduled jobs
-	if err := r.schedulerHandler.RestoreJobs(); err != nil {
-		r.log.Warn("failed to restore scheduled jobs from Redis", "error", err)
+	// Schedule static cron jobs for periodic tasks
+	// System indexes: every 5 minutes
+	if err := r.schedulerHandler.ScheduleCronJob("*/5 * * * *", taskscore.TaskTypeRefreshSystemIndexes); err != nil {
+		r.log.Warn("failed to schedule system indexes cron job", "error", err)
 	}
 
-	// Now run startup checks AFTER restoration completes
-	// The cleanup functions returned by schedulers will run the startup checks
-	// They will only trigger for task types that don't have scheduled jobs
-	for _, cleanup := range r.cleanups {
-		cleanup()
+	// Adjusted prices: every 5 minutes
+	if err := r.schedulerHandler.ScheduleCronJob("*/5 * * * *", taskscore.TaskTypeRefreshAdjustedPrices); err != nil {
+		r.log.Warn("failed to schedule adjusted prices cron job", "error", err)
+	}
+
+	// Restore one-time jobs from Redis (after handlers are registered)
+	if err := r.schedulerHandler.RestoreOneTimeJobs(); err != nil {
+		r.log.Warn("failed to restore one-time jobs from Redis", "error", err)
+	}
+
+	// Start the scheduler after all handlers are registered, cron jobs are scheduled, and one-time jobs are restored
+	if err := r.schedulerHandler.Start(); err != nil {
+		return err
 	}
 
 	r.log.Info("job registry started", "schedulers", len(r.cleanups))

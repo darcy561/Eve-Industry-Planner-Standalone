@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"time"
 
 	"eve-industry-planner/internal/tasks/esi"
@@ -39,6 +40,16 @@ func (w *jetstreamMessageWrapper) NumDelivered() uint64 {
 		return 1
 	}
 	return md.NumDelivered
+}
+
+// getMessageMetadata returns message metadata for logging purposes
+func getMessageMetadata(msg jetstream.Msg) (uint64, string) {
+	md, err := msg.Metadata()
+	if err != nil {
+		return 1, "unknown"
+	}
+	sequenceStr := fmt.Sprintf("%d/%d", md.Sequence.Stream, md.Sequence.Consumer)
+	return md.NumDelivered, sequenceStr
 }
 
 // wrapJetStreamMsg wraps a jetstream.Msg to esi.MessageInterface
